@@ -1,0 +1,22 @@
+--- a/soh/src/code/z_play.c
++++ b/soh/src/code/z_play.c
+@@ -12,8 +12,9 @@
+ #include "soh/OTRGlobals.h"
+ #include "soh/ResourceManagerHelpers.h"
+ #include "soh/SaveManager.h"
+ #include "soh/framebuffer_effects.h"
++#include "soh/Enhancements/SGK/SGKGrass.h" // SGK GRAMA 3D
+ 
+ #include <time.h>
+ #include <assert.h>
+ 
+@@ -1520,8 +1521,9 @@
+         }
+ 
+         if ((HREG(80) != 10) || (HREG(85) != 0)) {
+             Actor_DrawAll(play, &play->actorCtx);
++            SGKGrass_Draw(play); // SGK: grama 3D depois dos atores e com teste de profundidade
+         }
+ 
+         if ((HREG(80) != 10) || (HREG(86) != 0)) {
+             if (!play->envCtx.sunMoonDisabled) {
