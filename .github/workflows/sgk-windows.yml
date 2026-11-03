@@ -1,6 +1,9 @@
 name: SGK Grass - Build Windows x64
 
 on:
+  push:
+    branches:
+      - grama-9.3.1
   workflow_dispatch:
 
 permissions:
