@@ -74,6 +74,7 @@ jobs:
         run: |
           cmake -S . -B build-windows -G Ninja -DCMAKE_MAKE_PROGRAM=ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_REMOTE_CONTROL=1
           cmake --build build-windows --config Release --parallel 4
+          if ($LASTEXITCODE -ne 0) { throw 'Falha na compilacao do SoH, consultar log acima' }
           Push-Location build-windows
           cpack
           Pop-Location

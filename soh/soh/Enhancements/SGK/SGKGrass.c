@@ -20,7 +20,7 @@
 
 #define SGK_CACHE_CAPACITY 8192u
 #define SGK_CACHE_MASK (SGK_CACHE_CAPACITY - 1u)
-#define SGK_FLOOR_GRASS_SFX 8u /* z_bgcheck.c: tabela D_80119E10[8] */
+#define SGK_FLOOR_GRASS_SFX (NA_SE_PL_WALK_GRASS - SFX_FLAG) /* z_bgcheck.c: tabela D_80119E10[8] */
 
 /* A posicao e a identidade da planta NAO dependem do angulo da camera. */
 typedef struct SGKCell {
@@ -127,7 +127,7 @@ static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 layer,
     if (COLPOLY_GET_NORMAL(poly->normal.y) < 0.80f) {
         return cell;
     }
-    if ((SurfaceType_GetData(&play->colCtx, poly, bgId, 1) & 0xFU) != SGK_FLOOR_GRASS_SFX) {
+    if ((SurfaceType_GetSfx(&play->colCtx, poly, bgId)) != SGK_FLOOR_GRASS_SFX) {
         return cell;
     }
     if (SGK_IsUnderwater(play, x, floorY, z)) {
@@ -202,7 +202,7 @@ void SGKGrass_Draw(PlayState* play) {
     u32 tuftCount = 0;
     sFrameNumber++;
 
-    if (play == NULL || play->sceneNum != SCENE_SPOT04 ||
+    if (play == NULL || play->sceneNum != SCENE_KOKIRI_FOREST ||
         !CVarGetInteger("SGK.GrassEnabled", 1) || play->colCtx.colHeader == NULL) {
         return;
     }
@@ -243,7 +243,7 @@ void SGKGrass_Draw(PlayState* play) {
     gSPClearGeometryMode(POLY_OPA_DISP++, G_LIGHTING | G_CULL_BOTH | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
     gSPSetGeometryMode(POLY_OPA_DISP++, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH);
     Matrix_Push();
-    Matrix_Identity();
+    Matrix_Translate(0.0f, 0.0f, 0.0f, MTXMODE_NEW);
     gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx),
               G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
     Matrix_Pop();
@@ -266,7 +266,7 @@ void SGKGrass_Draw(PlayState* play) {
             if (v == NULL) goto SGK_Done;
             SGK_BuildTuft(v, ix, iz, cell->y, spacing, cell->seed,
                           (f32)sFrameNumber * 0.035f, wind);
-            gSPVertex(POLY_OPA_DISP++, v, 6, 0);
+            gSPVertex(POLY_OPA_DISP++, (uintptr_t)v, 6, 0);
             gSP2Triangles(POLY_OPA_DISP++, 0, 1, 2, 0, 3, 4, 5, 0);
             ++tuftCount;
         }
