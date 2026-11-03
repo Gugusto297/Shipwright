@@ -1,0 +1,86 @@
+name: SGK Grass - Build Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resources:
+    name: Gerar soh.o2r (sem ROM)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Dependencias Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y $(cat linux-build-deps/apt.txt)
+      - name: Gerar recursos oficiais
+        run: |
+          cmake -S . -B build-resources -G Ninja -DCMAKE_BUILD_TYPE=Release -DSOH_TOOLS_ONLY=ON
+          cmake --build build-resources --config Release --target GenerateSohOtr --parallel 4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SGK-recursos
+          path: soh.o2r
+          if-no-files-found: error
+          retention-days: 2
+
+  windows:
+    name: Compilar SoH SGK para Windows
+    needs: resources
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Ninja
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+      - name: Ambiente MSVC x64
+        uses: TheMrMilchmann/setup-msvc-dev@v4
+        with:
+          arch: x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: SGK-recursos
+          path: build-windows/soh
+      - name: Aplicar patch SGK em z_play.c (sem editar o codigo original)
+        shell: pwsh
+        run: |
+          git apply --check ALTERACOES_z_play.patch 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            git apply ALTERACOES_z_play.patch
+            if ($LASTEXITCODE -ne 0) { throw 'Falha ao aplicar patch SGK' }
+            Write-Host 'Patch SGK aplicado com sucesso.'
+          } else {
+            git apply --reverse --check ALTERACOES_z_play.patch 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host 'Patch SGK ja estava aplicado.'
+            } else {
+              throw 'z_play.c diferente do esperado: envie o log para corrigir o patch.'
+            }
+          }
+      - name: Compilar (Release)
+        shell: pwsh
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+        run: |
+          cmake -S . -B build-windows -G Ninja -DCMAKE_MAKE_PROGRAM=ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_REMOTE_CONTROL=1
+          cmake --build build-windows --config Release --parallel 4
+          Push-Location build-windows
+          cpack
+          Pop-Location
+      - name: ZIP do executavel
+        uses: actions/upload-artifact@v4
+        with:
+          name: SGK-SoH-Windows-x64
+          path: |
+            _packages/*.zip
+            build-windows/soh/soh.exe
+            build-windows/soh/soh.o2r
+          if-no-files-found: error
+          retention-days: 7
