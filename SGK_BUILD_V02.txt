@@ -1,0 +1,5 @@
+Compilacao da SGK Grass v0.2 solicitada em 2026-11-04.
+Versao-base: Ship of Harkinian 9.3.1.
+Branch: grama-9.3.1.
+Fonte SGKGrass.c atualizado no commit 5fe6811541a7cd87c65e89f1e2e84aa91890f8b1.
+Este arquivo marca a compilacao da v0.2; nao e necessario para rodar o jogo.
