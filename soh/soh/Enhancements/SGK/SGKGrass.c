@@ -1,8 +1,11 @@
 /*
- * SGK Grass 0.5 - Kokiri, Ship of Harkinian 9.3.1.
+ * SGK Grass 0.6 - Kokiri, Ship of Harkinian 9.3.1.
  * Stable high-resolution world-space blades, conservative camera frustum,
  * overlapping distance LOD and smoothed actor bending.
- * SGK 0.5 eliminates direct-mapped cache thrash and view-dependent blade caps.
+ * SGK 0.6 makes collision sampling invariant to Link's elevation (stairs/ladders).
+ * Vertical camera culling now uses true cached terrain height and conservative
+ * chunk bounds; foliage no longer resets just because Link changes elevation.
+ * Grass height alone is reduced by default; width/density/spacing unchanged.
  * Eight-way bucketed collision cache, fixed world-space thinning, low-amplitude
  * wind, pre-warmed offscreen collision cells, stable tips at LOD boundaries.
  * Does not replace textures, OTR/O2R mods or character models.
@@ -27,8 +30,8 @@
 #define SGK_CHUNK_SIDE 6 /* group nearby cells before collision queries */
 #define SGK_VERTEX_PRECISION 4.0f /* 0.25-world-unit precision; Kokiri-only */
 #define SGK_VERTEX_SCALE (1.0f / SGK_VERTEX_PRECISION)
-#define SGK_NEW_CELL_FADE_FRAMES 24u
-#define SGK_PREFETCH_SAMPLES_PER_TIER 42u
+#define SGK_NEW_CELL_FADE_FRAMES 40u
+#define SGK_PREFETCH_SAMPLES_PER_TIER 24u
 #define SGK_PREFETCH_PERIOD 8192u
 
 typedef struct SGKCell {
@@ -65,7 +68,9 @@ static f32 SGK_Clamp(f32 x, f32 lo, f32 hi);
 static SGKCell sCells[SGK_CACHE_CAPACITY];
 static s32 sCachedScene = -1;
 static s32 sCachedQuality = -1;
-static s32 sCachedLayer = INT_MIN;
+/* This also detects a scene re-entered with the same numeric scene ID. */
+static const CollisionHeader* sCachedCollisionHeader = NULL;
+static u32 sPreviousGameplayFrame = 0u;
 static u32 sFrameNumber = 0;
 static u32 sCacheMisses = 0;
 static u32 sDrawnBlades = 0;
@@ -261,7 +266,6 @@ static void SGK_ResetCache(s32 scene, s32 quality) {
     memset(sCells, 0, sizeof(sCells));
     sCachedScene = scene;
     sCachedQuality = quality;
-    sCachedLayer = INT_MIN;
     sCacheMisses = 0;
     sCacheEvictions = 0;
     memset(sPrefetchCursor, 0, sizeof(sPrefetchCursor));
@@ -285,6 +289,10 @@ static s32 SGK_IsUnderwater(PlayState* play, f32 x, f32 y, f32 z) {
  */
 static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 tier,
                             s32 layer, s32 spacing, f32 playerY, u32 raycastBudget) {
+    /* Kept as a parameter for callers, but never used for geometry classification.
+     * Otherwise a player climbing a ladder invalidates the distant field.
+     */
+    (void)playerY;
     u32 seed = SGK_Seed(gx, gz, tier);
     /* One slot per hash in v0.4 could replace visible plants every frame.
      * 8-way bucket search retains nearby colliding keys simultaneously.
@@ -338,11 +346,15 @@ static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 tier,
     x = ((f32)gx + 0.15f + 0.70f * SGK_Unit(SGK_Hash(seed ^ 0xa77u))) * spacing;
     z = ((f32)gz + 0.15f + 0.70f * SGK_Unit(SGK_Hash(seed ^ 0xb91u))) * spacing;
     pos.x = x;
-    pos.y = playerY + 210.0f;
+    /* A fixed scene-relative top-down ray means the SAME world cell always
+     * produces the SAME ground, regardless of Link's height. Previously a
+     * ray starting at playerY+210 and a |floorY-playerY| test poisoned
+     * cached cells when climbing ladders or stairs.
+     */
+    pos.y = SGK_Clamp(play->colCtx.maxBounds.y + 12.0f, -32000.0f, 32700.0f);
     pos.z = z;
     floorY = BgCheck_EntityRaycastFloor3(&play->colCtx, &poly, &bgId, &pos);
     if (poly == NULL || bgId != BGCHECK_SCENE || floorY <= BGCHECK_Y_MIN + 1.0f) return cell;
-    if (fabsf(floorY - playerY) > 170.0f) return cell;
     if (COLPOLY_GET_NORMAL(poly->normal.y) < 0.72f) return cell;
     if (SurfaceType_GetSfx(&play->colCtx, poly, bgId) != SGK_FLOOR_GRASS_SFX) return cell;
     if (SGK_IsUnderwater(play, x, floorY, z)) return cell;
@@ -407,7 +419,7 @@ static void SGK_Vertex(Vtx* v, f32 x, f32 y, f32 z, u8 r, u8 g, u8 b) {
  */
 static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
                           s32 spacing, u32 bladeIndex, s32 tier, f32 phase, s32 wind,
-                          f32 scale, f32 cellGust) {
+                          f32 scale, f32 cellGust, f32 heightScale) {
     u32 n = SGK_Hash(cell->seed ^ (bladeIndex + 1u) * 0x165667b1U);
     f32 cellX = ((f32)gx + 0.15f + 0.70f * SGK_Unit(SGK_Hash(cell->seed ^ 0xa77u))) * spacing;
     f32 cellZ = ((f32)gz + 0.15f + 0.70f * SGK_Unit(SGK_Hash(cell->seed ^ 0xb91u))) * spacing;
@@ -427,7 +439,8 @@ static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
      */
     f32 heightFade = 0.06f + 0.94f * scale;
     f32 widthFade = 0.80f + 0.20f * scale;
-    f32 h = (heightBase + 6.0f * SGK_Unit(SGK_Hash(n ^ 0xf66u))) * heightFade;
+    /* 15 percent shorter by default, ONLY the vertical length changes. */
+    f32 h = (heightBase + 6.0f * SGK_Unit(SGK_Hash(n ^ 0xf66u))) * heightFade * heightScale;
     f32 w = ((tier == 0 ? 1.05f : tier == 1 ? 1.08f : 1.15f) +
              0.32f * SGK_Unit(SGK_Hash(n ^ 0x117u))) * widthFade;
     /* Shared slow gust per cell + individual ripples: fewer trigonometry calls
@@ -459,6 +472,7 @@ static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
 
 void SGKGrass_Draw(PlayState* play) {
     s32 quality, tier, distancePercent, layer, wind, budget, interaction, viewCull;
+    f32 heightScale, sceneMidY, sceneHalfY;
     f32 px, py, pz;
     f32 phase;
     u32 vertsInBatch = 0;
@@ -469,7 +483,7 @@ void SGKGrass_Draw(PlayState* play) {
     if (play == NULL || play->sceneNum != SCENE_KOKIRI_FOREST ||
         !CVarGetInteger("SGK.GrassEnabled", 1) || play->colCtx.colHeader == NULL) return;
     if (!sVersionLogged) {
-        osSyncPrintf("[SGK Grass 0.5] associative cache + stable LOD + background precache active\n");
+        osSyncPrintf("[SGK Grass 0.6] elevation-invariant terrain cache + shortened blades\n");
         sVersionLogged = 1;
     }
 
@@ -479,9 +493,15 @@ void SGKGrass_Draw(PlayState* play) {
     wind = CVarGetInteger("SGK.GrassWind", 1);
     distancePercent = CVarGetInteger("SGK.GrassDistance", 100);
     distancePercent = (s32)SGK_Clamp((f32)distancePercent, 50.0f, 180.0f);
-    budget = CVarGetInteger("SGK.GrassRaycastBudget", 400);
+    /* Lower CPU raycast pressure; cache is now stable across stair travel. */
+    budget = CVarGetInteger("SGK.GrassRaycastBudget", 300);
     if (budget < 80) budget = 80;
-    if (budget > 850) budget = 850;
+    if (budget > 700) budget = 700;
+    /* Height only. Does not change width, number or distribution of blades. */
+    heightScale = SGK_Clamp((f32)CVarGetInteger("SGK.GrassHeightPercent", 85), 55.0f, 120.0f) * 0.01f;
+    sceneMidY = (play->colCtx.minBounds.y + play->colCtx.maxBounds.y) * 0.5f;
+    sceneHalfY = (play->colCtx.maxBounds.y - play->colCtx.minBounds.y) * 0.5f;
+    if (sceneHalfY < 0.0f) sceneHalfY = 0.0f;
     viewCull = CVarGetInteger("SGK.GrassViewCulling", 1);
     interaction = CVarGetInteger("SGK.GrassInteraction", 1);
     SGK_InitView(&play->view);
@@ -493,16 +513,23 @@ void SGKGrass_Draw(PlayState* play) {
     px = GET_PLAYER(play)->actor.world.pos.x;
     py = GET_PLAYER(play)->actor.world.pos.y;
     pz = GET_PLAYER(play)->actor.world.pos.z;
-    layer = SGK_GridFloor(py, 330);
+    /* Global Kokiri ground cache, not a Link-height-dependent slice.
+     * It is safe because the raycast above always starts at scene max Y.
+     */
+    layer = 0;
     phase = (f32)sFrameNumber * 0.0215f; /* gradual, spatial wind waves */
     sRaycastsThisFrame = 0;
 
-    if (sCachedScene != play->sceneNum || sCachedQuality != quality) SGK_ResetCache(play->sceneNum, quality);
-    /* Crossing a 330-unit height boundary must NOT clear the entire scene.
-     * Separate elevations are already part of the per-cell cache key.
-     * v0.3 used to clear all cells here, leading to a full visible flash.
+    /* A reset is only allowed after scene reload, quality change, or a new
+     * PlayState lifetime; NEVER when Link merely changes elevation.
      */
-    sCachedLayer = layer;
+    if (sCachedScene != play->sceneNum || sCachedQuality != quality ||
+        sCachedCollisionHeader != play->colCtx.colHeader ||
+        play->gameplayFrames < sPreviousGameplayFrame) {
+        SGK_ResetCache(play->sceneNum, quality);
+        sCachedCollisionHeader = play->colCtx.colHeader;
+    }
+    sPreviousGameplayFrame = play->gameplayFrames;
     sNewCells = 0;
     sFrameCachedCells = 0;
 
@@ -586,10 +613,15 @@ void SGKGrass_Draw(PlayState* play) {
                 chunkZ = (playerChunkZ + offsetZ) * SGK_CHUNK_SIDE;
                 f32 centerX = ((f32)chunkX + 0.5f * (f32)countX) * spacing;
                 f32 centerZ = ((f32)chunkZ + 0.5f * (f32)countZ) * spacing;
-                f32 chunkRadius = (f32)SGK_CHUNK_SIDE * (f32)spacing * 0.75f + 150.0f;
+                /* Sphere encloses both XZ chunk size and the *full* static
+                 * scene height range. No stairs-induced culling of low grass.
+                 * Fine cull below uses the cached ground Y for precision.
+                 */
+                f32 chunkRadius = (f32)SGK_CHUNK_SIDE * (f32)spacing * 0.75f +
+                                  sceneHalfY + 45.0f;
                 f32 cdX = centerX - px, cdZ = centerZ - pz;
                 if (cdX * cdX + cdZ * cdZ > (maxR + chunkRadius) * (maxR + chunkRadius)) continue;
-                if (!SGK_Visible(centerX, py, centerZ, chunkRadius)) { ++sCulledChunks; continue; }
+                if (!SGK_Visible(centerX, sceneMidY, centerZ, chunkRadius)) { ++sCulledChunks; continue; }
                 for (iz = chunkZ; iz < chunkZ + countZ; ++iz) {
                     for (ix = chunkX; ix < chunkX + countX; ++ix) {
                         f32 x = ((f32)ix + 0.5f) * spacing;
@@ -601,7 +633,11 @@ void SGKGrass_Draw(PlayState* play) {
                         u32 blade, seed;
                         if (d2 < (f32)(minR * minR) || d2 > (f32)(maxR * maxR)) continue;
                         ++sConsideredCells;
-                        if (!SGK_Visible(x, py, z, (f32)spacing * 1.3f + 65.0f)) {
+                        /* Conservative broad phase before raycast. The actual
+                         * world-space floor Y is not yet known here.
+                         */
+                        if (!SGK_Visible(x, sceneMidY, z,
+                                         (f32)spacing * 1.3f + sceneHalfY + 65.0f)) {
                             ++sCulledCells;
                             continue;
                         }
@@ -609,6 +645,14 @@ void SGKGrass_Draw(PlayState* play) {
                         if (SGK_Unit(SGK_Hash(seed ^ 0x3bau)) > density) continue;
                         cell = SGK_GetCell(play, ix, iz, tier, layer, spacing, py, (u32)budget);
                         if (cell == NULL || !cell->occupied) continue;
+                        /* Exact narrow phase: visible cells use the true floor
+                         * height, even if Link is above them on a ladder.
+                         * Data remains cached when drawing is skipped.
+                         */
+                        if (!SGK_Visible(x, cell->y, z, (f32)spacing * 1.3f + 65.0f)) {
+                            ++sCulledCells;
+                            continue;
+                        }
                         distance = sqrtf(d2);
                         /* Continuous smooth overlap of neighboring LOD rings.
                          * No hard 24% cutoff: the geometry eases almost to zero.
@@ -630,7 +674,7 @@ void SGKGrass_Draw(PlayState* play) {
                                 if (batch == NULL) goto SGK_Finish;
                             }
                             SGK_MakeBlade(&batch[vertsInBatch], cell, ix, iz, spacing,
-                                          blade, tier, phase, wind, fade, cellGust);
+                                          blade, tier, phase, wind, fade, cellGust, heightScale);
                             vertsInBatch += 3u;
                             ++totalBlades;
                             if (vertsInBatch == SGK_BATCH_BLADES * 3u) SGK_FLUSH_BATCH();
@@ -656,7 +700,7 @@ SGK_Finish:
     SGK_Prewarm(play, px, py, pz, quality, layer, (u32)budget, distancePercent);
 
     if (CVarGetInteger("SGK.GrassDebug", 0) && (sFrameNumber % 300u) == 0u) {
-        osSyncPrintf("[SGK 0.5] quality=%d dist=%d%% cells=%u blades=%u rays=%u new=%u cache_evictions=%u precache=%u visible_cells=%u cache=%u culled_chunks=%u culled_cells=%u actors=%u\n",
+        osSyncPrintf("[SGK 0.6] quality=%d dist=%d%% cells=%u blades=%u rays=%u new=%u cache_evictions=%u precache=%u visible_cells=%u cache=%u culled_chunks=%u culled_cells=%u actors=%u\n",
                      quality, distancePercent, sDrawnCells, sDrawnBlades, sRaycastsThisFrame,
                      sNewCells, sCacheEvictions, sPrecacheRequests, sFrameCachedCells,
                      sCacheMisses, sCulledChunks, sCulledCells, sInfluenceCount);
