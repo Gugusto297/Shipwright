@@ -541,10 +541,15 @@ static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
                                    (f32)(n & 255u) * 0.023f) : 0.0f;
     f32 high = tier == 0 ? sinf(phase * 1.01f +
                                  (f32)((n >> 8) & 255u) * 0.017f) * 0.075f : 0.0f;
+    /* The second broad wave also modulates gust intensity: slow, irregular
+     * wind swell without another expensive sine per individual leaf. */
+    f32 gustEnvelope = 0.80f + 0.20f * cellGust2;
     f32 windX = wind ? (cellGust * 0.59f + cellGust2 * 0.22f +
-                         ripple * 0.22f + high) * windPower * heightFade : 0.0f;
+                         ripple * 0.22f + high) * windPower * heightFade *
+                         gustEnvelope : 0.0f;
     f32 windZ = wind ? (cellGust2 * 0.52f - cellGust * 0.14f +
-                         ripple * 0.17f - high * 0.45f) * windPower * heightFade : 0.0f;
+                         ripple * 0.17f - high * 0.45f) * windPower * heightFade *
+                         gustEnvelope : 0.0f;
     f32 bendX = windX * (0.59f + 0.15f * (f32)(n & 3u)) + cell->pushX * heightFade;
     f32 bendZ = windZ * (0.40f + 0.12f * (f32)((n >> 3) & 3u)) + cell->pushZ * heightFade;
     u32 tint = SGK_Hash(n ^ 0x3185u) % 25u;
@@ -562,7 +567,10 @@ static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
 
     SGK_Vertex(&v[0], x - dx * w, y, z - dz * w, r0, g0, b0);
     SGK_Vertex(&v[1], x + dx * w, y, z + dz * w, r0, g0, b0);
-    SGK_Vertex(&v[2], x + bendX + dx * (w * 0.25f), y + h,
+    /* Gently lower the tip while bending to mimic a flexible stalk.
+     * Root and width stay fixed, preventing flickering subpixel geometry. */
+    SGK_Vertex(&v[2], x + bendX + dx * (w * 0.25f),
+               y + h - (fabsf(windX) + fabsf(windZ)) * 0.16f,
                z + bendZ + dz * (w * 0.25f), r1, g1, b1);
 }
 
