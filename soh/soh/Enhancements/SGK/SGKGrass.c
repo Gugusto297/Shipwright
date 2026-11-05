@@ -1,15 +1,17 @@
 /*
- * SGK Grass 0.6 - Kokiri, Ship of Harkinian 9.3.1.
+ * SGK Grass 0.7 - terrain-aware vegetation across the full game, SoH 9.3.1.
  * Stable high-resolution world-space blades, conservative camera frustum,
  * overlapping distance LOD and smoothed actor bending.
- * SGK 0.6 makes collision sampling invariant to Link's elevation (stairs/ladders).
+ * SGK 0.7 keeps elevation-independent sampling and adds conservative material checks.
  * Vertical camera culling now uses true cached terrain height and conservative
  * chunk bounds; foliage no longer resets just because Link changes elevation.
  * Grass height alone is reduced by default; width/density/spacing unchanged.
  * Eight-way bucketed collision cache, fixed world-space thinning, low-amplitude
  * wind, pre-warmed offscreen collision cells, stable tips at LOD boundaries.
  * Does not replace textures, OTR/O2R mods or character models.
- * The mask is based on collision surface sound, NOT visual texture/material.
+ * Only collision surfaces tagged grass are eligible, checked at three points.
+ * This DOES NOT guarantee pixel-perfect discrimination of grass textures vs paths
+ * when the original map uses the same collision polygon/sound for both.
  */
 #include "global.h"
 #include "soh/Enhancements/SGK/SGKGrass.h"
@@ -28,7 +30,7 @@
 #define SGK_PI 3.14159265358979323846f
 #define SGK_MAX_INFLUENCES 24
 #define SGK_CHUNK_SIDE 6 /* group nearby cells before collision queries */
-#define SGK_VERTEX_PRECISION 4.0f /* 0.25-world-unit precision; Kokiri-only */
+#define SGK_VERTEX_PRECISION 4.0f /* 0.25-world-unit precision in camera-local coordinates */
 #define SGK_VERTEX_SCALE (1.0f / SGK_VERTEX_PRECISION)
 #define SGK_NEW_CELL_FADE_FRAMES 40u
 #define SGK_PREFETCH_SAMPLES_PER_TIER 24u
@@ -85,6 +87,14 @@ static u32 sCacheEvictions = 0;
 static u32 sPrecacheRequests = 0;
 static s32 sVersionLogged = 0;
 static u32 sPrefetchCursor[3] = { 0u, 0u, 0u };
+/* A conservative scene-wide material preflight avoids scanning barren scenes
+ * every frame (temples/stone/deserts without grass footstep polygons). */
+static s32 sSceneHasGrass = -1;
+/* Stable world origin for int16 Vtx coordinates, otherwise large maps overflow
+ * the 0.25-unit precision model when |world position| exceeds 8190 units. */
+static f32 sVertexOriginX = 0.0f;
+static f32 sVertexOriginY = 0.0f;
+static f32 sVertexOriginZ = 0.0f;
 
 typedef struct SGKInfluence {
     f32 x, y, z;
@@ -269,6 +279,7 @@ static void SGK_ResetCache(s32 scene, s32 quality) {
     sCacheMisses = 0;
     sCacheEvictions = 0;
     memset(sPrefetchCursor, 0, sizeof(sPrefetchCursor));
+    sSceneHasGrass = -1;
 }
 
 static s32 SGK_IsUnderwater(PlayState* play, f32 x, f32 y, f32 z) {
@@ -284,6 +295,45 @@ static s32 SGK_IsUnderwater(PlayState* play, f32 x, f32 y, f32 z) {
     return 0;
 }
 
+/* A static polygon tagged with the grass footstep sound is a necessary
+ * condition for SGK vegetation. No scene-name whitelist: this covers ANY
+ * game region containing such polygons, without planting on flagged rock.
+ * This scan runs only on scene reset and short-circuits on first match. */
+static s32 SGK_SceneContainsGrass(PlayState* play) {
+    CollisionHeader* head = play->colCtx.colHeader;
+    u32 i;
+    if (head == NULL || head->polyList == NULL) return 0;
+    for (i = 0; i < (u32)head->numPolygons; ++i) {
+        CollisionPoly* poly = &head->polyList[i];
+        if (COLPOLY_GET_NORMAL(poly->normal.y) >= 0.72f &&
+            SurfaceType_GetSfx(&play->colCtx, poly, BGCHECK_SCENE) == SGK_FLOOR_GRASS_SFX) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Optional conservative edge verification: a path/rock bordering grass
+ * should not inherit leaves merely because the center point lands on grass.
+ * This still cannot split one visual polygon that shares the same grass
+ * collision tag across grassy and path textures. */
+static s32 SGK_GrassProbe(PlayState* play, f32 x, f32 z, f32 sourceY, f32 heightLimit) {
+    Vec3f pos;
+    CollisionPoly* poly = NULL;
+    s32 bgId = BG_ACTOR_MAX;
+    f32 y;
+    pos.x = x;
+    pos.y = SGK_Clamp(play->colCtx.maxBounds.y + 12.0f, -32000.0f, 32700.0f);
+    pos.z = z;
+    y = BgCheck_EntityRaycastFloor3(&play->colCtx, &poly, &bgId, &pos);
+    ++sRaycastsThisFrame;
+    return poly != NULL && bgId == BGCHECK_SCENE && y > BGCHECK_Y_MIN + 1.0f &&
+           fabsf(y - sourceY) <= heightLimit &&
+           COLPOLY_GET_NORMAL(poly->normal.y) >= 0.72f &&
+           SurfaceType_GetSfx(&play->colCtx, poly, bgId) == SGK_FLOOR_GRASS_SFX &&
+           !SGK_IsUnderwater(play, x, y, z);
+}
+
 /* Collision queries are spread over frames to avoid a long first-frame pause.
  * Null means a query has been deferred; occupied=0 is a completed, empty query.
  */
@@ -294,6 +344,8 @@ static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 tier,
      */
     (void)playerY;
     u32 seed = SGK_Seed(gx, gz, tier);
+    s32 useEdgeCheck = CVarGetInteger("SGK.GrassEdgeCheck", 1) != 0;
+    u32 raycastCost = useEdgeCheck ? 3u : 1u;
     /* One slot per hash in v0.4 could replace visible plants every frame.
      * 8-way bucket search retains nearby colliding keys simultaneously.
      * Choose an unused slot, otherwise evict least recently used.
@@ -323,7 +375,7 @@ static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 tier,
     CollisionPoly* poly = NULL;
     s32 bgId = BG_ACTOR_MAX;
 
-    if (sRaycastsThisFrame >= raycastBudget) return NULL;
+    if (sRaycastsThisFrame + raycastCost > raycastBudget) return NULL;
     if (cell->valid) ++sCacheEvictions;
 
     cell->valid = 1;
@@ -358,6 +410,18 @@ static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 tier,
     if (COLPOLY_GET_NORMAL(poly->normal.y) < 0.72f) return cell;
     if (SurfaceType_GetSfx(&play->colCtx, poly, bgId) != SGK_FLOOR_GRASS_SFX) return cell;
     if (SGK_IsUnderwater(play, x, floorY, z)) return cell;
+    if (useEdgeCheck) {
+        /* Stable opposite diagonals, independent of camera or player direction.
+         * Probe offsets remain inside the cell in all quality tiers. */
+        f32 offset = (f32)spacing * 0.20f;
+        f32 sx = (seed & 1u) ? offset : -offset;
+        f32 sz = (seed & 2u) ? offset : -offset;
+        f32 maxHeightStep = SGK_Clamp((f32)spacing * 0.70f, 9.0f, 40.0f);
+        if (!SGK_GrassProbe(play, x + sx, z + sz, floorY, maxHeightStep) ||
+            !SGK_GrassProbe(play, x - sx, z - sz, floorY, maxHeightStep)) {
+            return cell;
+        }
+    }
 
     cell->y = floorY + 1.10f;
     cell->normalX = poly->normal.x;
@@ -401,9 +465,9 @@ static void SGK_Vertex(Vtx* v, f32 x, f32 y, f32 z, u8 r, u8 g, u8 b) {
      * Prior releases used sub-unit blades whose endpoints often collapsed to
      * the SAME integer coordinate, causing intermittent zero-area triangles.
      */
-    v->v.ob[0] = (s16)SGK_Clamp(roundf(x * SGK_VERTEX_PRECISION), -32760.0f, 32760.0f);
-    v->v.ob[1] = (s16)SGK_Clamp(roundf(y * SGK_VERTEX_PRECISION), -32760.0f, 32760.0f);
-    v->v.ob[2] = (s16)SGK_Clamp(roundf(z * SGK_VERTEX_PRECISION), -32760.0f, 32760.0f);
+    v->v.ob[0] = (s16)SGK_Clamp(roundf((x - sVertexOriginX) * SGK_VERTEX_PRECISION), -32760.0f, 32760.0f);
+    v->v.ob[1] = (s16)SGK_Clamp(roundf((y - sVertexOriginY) * SGK_VERTEX_PRECISION), -32760.0f, 32760.0f);
+    v->v.ob[2] = (s16)SGK_Clamp(roundf((z - sVertexOriginZ) * SGK_VERTEX_PRECISION), -32760.0f, 32760.0f);
     v->v.flag = 0;
     v->v.tc[0] = 0;
     v->v.tc[1] = 0;
@@ -419,7 +483,7 @@ static void SGK_Vertex(Vtx* v, f32 x, f32 y, f32 z, u8 r, u8 g, u8 b) {
  */
 static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
                           s32 spacing, u32 bladeIndex, s32 tier, f32 phase, s32 wind,
-                          f32 scale, f32 cellGust, f32 heightScale) {
+                          f32 scale, f32 cellGust, f32 cellGust2, f32 heightScale, f32 windPower) {
     u32 n = SGK_Hash(cell->seed ^ (bladeIndex + 1u) * 0x165667b1U);
     f32 cellX = ((f32)gx + 0.15f + 0.70f * SGK_Unit(SGK_Hash(cell->seed ^ 0xa77u))) * spacing;
     f32 cellZ = ((f32)gz + 0.15f + 0.70f * SGK_Unit(SGK_Hash(cell->seed ^ 0xb91u))) * spacing;
@@ -446,11 +510,18 @@ static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
     /* Shared slow gust per cell + individual ripples: fewer trigonometry calls
      * than computing two full waves anew for every leaf at every frame.
      */
-    f32 ripple = sinf(phase * 0.62f - z * 0.018f + (f32)(n & 255u) * 0.021f);
-    f32 high = tier == 0 ? sinf(phase * 1.02f + (f32)((n >> 8) & 255u) * 0.019f) * 0.09f : 0.0f;
-    f32 sway = wind ? (cellGust * 0.70f + ripple * 0.35f + high) * heightFade : 0.0f;
-    f32 bendX = sway * (0.59f + 0.15f * (f32)(n & 3u)) + cell->pushX * heightFade;
-    f32 bendZ = sway * (0.40f + 0.12f * (f32)((n >> 3) & 3u)) + cell->pushZ * heightFade;
+    /* Two long, world-space wind fronts plus a small independent ripple.
+     * Far LOD skips per-blade trig to protect integrated graphics. */
+    f32 ripple = tier != 2 ? sinf(phase * 0.52f - z * 0.012f +
+                                   (f32)(n & 255u) * 0.023f) : 0.0f;
+    f32 high = tier == 0 ? sinf(phase * 1.01f +
+                                 (f32)((n >> 8) & 255u) * 0.017f) * 0.075f : 0.0f;
+    f32 windX = wind ? (cellGust * 0.59f + cellGust2 * 0.22f +
+                         ripple * 0.22f + high) * windPower * heightFade : 0.0f;
+    f32 windZ = wind ? (cellGust2 * 0.52f - cellGust * 0.14f +
+                         ripple * 0.17f - high * 0.45f) * windPower * heightFade : 0.0f;
+    f32 bendX = windX * (0.59f + 0.15f * (f32)(n & 3u)) + cell->pushX * heightFade;
+    f32 bendZ = windZ * (0.40f + 0.12f * (f32)((n >> 3) & 3u)) + cell->pushZ * heightFade;
     u32 tint = SGK_Hash(n ^ 0x3185u) % 25u;
     /* Muted BOTW-like greens, less stark tip/base contrast and sparkle. */
     u8 r0 = (u8)(kind == 3 ? 54u + tint : 45u + tint);
@@ -472,7 +543,7 @@ static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
 
 void SGKGrass_Draw(PlayState* play) {
     s32 quality, tier, distancePercent, layer, wind, budget, interaction, viewCull;
-    f32 heightScale, sceneMidY, sceneHalfY;
+    f32 heightScale, sceneMidY, sceneHalfY, windPower;
     f32 px, py, pz;
     f32 phase;
     u32 vertsInBatch = 0;
@@ -480,10 +551,10 @@ void SGKGrass_Draw(PlayState* play) {
     u32 totalBlades = 0, totalCells = 0;
 
     ++sFrameNumber;
-    if (play == NULL || play->sceneNum != SCENE_KOKIRI_FOREST ||
-        !CVarGetInteger("SGK.GrassEnabled", 1) || play->colCtx.colHeader == NULL) return;
+    if (play == NULL || !CVarGetInteger("SGK.GrassEnabled", 1) ||
+        play->colCtx.colHeader == NULL) return;
     if (!sVersionLogged) {
-        osSyncPrintf("[SGK Grass 0.6] elevation-invariant terrain cache + shortened blades\n");
+        osSyncPrintf("[SGK Grass 0.7] all-scene tagged grass + soft wind + conservative edges\n");
         sVersionLogged = 1;
     }
 
@@ -491,6 +562,8 @@ void SGKGrass_Draw(PlayState* play) {
     if (quality < 0) quality = 0;
     if (quality > 2) quality = 2;
     wind = CVarGetInteger("SGK.GrassWind", 1);
+    windPower = SGK_Clamp((f32)CVarGetInteger("SGK.GrassWindStrength", 100),
+                           0.0f, 180.0f) * 0.01f;
     distancePercent = CVarGetInteger("SGK.GrassDistance", 100);
     distancePercent = (s32)SGK_Clamp((f32)distancePercent, 50.0f, 180.0f);
     /* Lower CPU raycast pressure; cache is now stable across stair travel. */
@@ -532,6 +605,14 @@ void SGKGrass_Draw(PlayState* play) {
     sPreviousGameplayFrame = play->gameplayFrames;
     sNewCells = 0;
     sFrameCachedCells = 0;
+    if (sSceneHasGrass < 0) sSceneHasGrass = SGK_SceneContainsGrass(play);
+    if (!sSceneHasGrass) return; /* never spend per-frame work on non-grass scenes */
+
+    /* Fixed local origin per frame: preserve 0.25-unit precision without
+     * clamping vertices on large world maps or inside distant areas. */
+    sVertexOriginX = floorf(px / 32.0f) * 32.0f;
+    sVertexOriginY = floorf(py / 32.0f) * 32.0f;
+    sVertexOriginZ = floorf(pz / 32.0f) * 32.0f;
 
     OPEN_DISPS(play->state.gfxCtx);
     POLY_OPA_DISP = Gfx_SetupDL(POLY_OPA_DISP, 25);
@@ -543,7 +624,7 @@ void SGKGrass_Draw(PlayState* play) {
     gSPClearGeometryMode(POLY_OPA_DISP++, G_LIGHTING | G_CULL_BOTH | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
     gSPSetGeometryMode(POLY_OPA_DISP++, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH);
     Matrix_Push();
-    Matrix_Translate(0.0f, 0.0f, 0.0f, MTXMODE_NEW);
+    Matrix_Translate(sVertexOriginX, sVertexOriginY, sVertexOriginZ, MTXMODE_NEW);
     Matrix_Scale(SGK_VERTEX_SCALE, SGK_VERTEX_SCALE, SGK_VERTEX_SCALE, MTXMODE_APPLY);
     gSPMatrix(POLY_OPA_DISP++, MATRIX_NEWMTX(play->state.gfxCtx),
               G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
@@ -628,7 +709,7 @@ void SGKGrass_Draw(PlayState* play) {
                         f32 z = ((f32)iz + 0.5f) * spacing;
                         f32 dx = x - px, dz = z - pz;
                         f32 d2 = dx * dx + dz * dz;
-                        f32 distance, fade, ageFade, cellGust;
+                        f32 distance, fade, ageFade, cellGust, cellGust2;
                         SGKCell* cell;
                         u32 blade, seed;
                         if (d2 < (f32)(minR * minR) || d2 > (f32)(maxR * maxR)) continue;
@@ -666,7 +747,9 @@ void SGKGrass_Draw(PlayState* play) {
                         if (ageFade < fade) fade = ageFade;
                         if (fade < 0.035f) continue; /* roots are tiny at this distance */
                         SGK_UpdateBend(cell, x, cell->y, z, interaction);
-                        cellGust = wind ? sinf(phase * 0.34f + x * 0.012f + z * 0.010f) : 0.0f;
+                        cellGust = wind ? sinf(phase * 0.33f + x * 0.010f + z * 0.008f) : 0.0f;
+                        cellGust2 = wind ? sinf(phase * 0.24f - x * 0.006f +
+                                                  z * 0.011f + 1.41f) : 0.0f;
                         ++sFrameCachedCells;
                         for (blade = 0; blade < cfg.bladesPerCell; ++blade) {
                             if (batch == NULL) {
@@ -674,7 +757,8 @@ void SGKGrass_Draw(PlayState* play) {
                                 if (batch == NULL) goto SGK_Finish;
                             }
                             SGK_MakeBlade(&batch[vertsInBatch], cell, ix, iz, spacing,
-                                          blade, tier, phase, wind, fade, cellGust, heightScale);
+                                          blade, tier, phase, wind, fade, cellGust,
+                                          cellGust2, heightScale, windPower);
                             vertsInBatch += 3u;
                             ++totalBlades;
                             if (vertsInBatch == SGK_BATCH_BLADES * 3u) SGK_FLUSH_BATCH();
@@ -700,8 +784,8 @@ SGK_Finish:
     SGK_Prewarm(play, px, py, pz, quality, layer, (u32)budget, distancePercent);
 
     if (CVarGetInteger("SGK.GrassDebug", 0) && (sFrameNumber % 300u) == 0u) {
-        osSyncPrintf("[SGK 0.6] quality=%d dist=%d%% cells=%u blades=%u rays=%u new=%u cache_evictions=%u precache=%u visible_cells=%u cache=%u culled_chunks=%u culled_cells=%u actors=%u\n",
-                     quality, distancePercent, sDrawnCells, sDrawnBlades, sRaycastsThisFrame,
+        osSyncPrintf("[SGK 0.7] scene=%d quality=%d dist=%d%% cells=%u blades=%u rays=%u new=%u cache_evictions=%u precache=%u visible_cells=%u cache=%u culled_chunks=%u culled_cells=%u actors=%u\n",
+                     play->sceneNum, quality, distancePercent, sDrawnCells, sDrawnBlades, sRaycastsThisFrame,
                      sNewCells, sCacheEvictions, sPrecacheRequests, sFrameCachedCells,
                      sCacheMisses, sCulledChunks, sCulledCells, sInfluenceCount);
     }
