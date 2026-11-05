@@ -90,6 +90,9 @@ static u32 sPrefetchCursor[3] = { 0u, 0u, 0u };
 /* A conservative scene-wide material preflight avoids scanning barren scenes
  * every frame (temples/stone/deserts without grass footstep polygons). */
 static s32 sSceneHasGrass = -1;
+/* CVar material policy is read once per frame, not for every cached cell. */
+static s32 sEdgeCheck = 1;
+static s32 sCachedEdgeCheck = -1;
 /* Stable world origin for int16 Vtx coordinates, otherwise large maps overflow
  * the 0.25-unit precision model when |world position| exceeds 8190 units. */
 static f32 sVertexOriginX = 0.0f;
@@ -280,6 +283,7 @@ static void SGK_ResetCache(s32 scene, s32 quality) {
     sCacheEvictions = 0;
     memset(sPrefetchCursor, 0, sizeof(sPrefetchCursor));
     sSceneHasGrass = -1;
+    sCachedEdgeCheck = sEdgeCheck;
 }
 
 static s32 SGK_IsUnderwater(PlayState* play, f32 x, f32 y, f32 z) {
@@ -344,7 +348,7 @@ static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 tier,
      */
     (void)playerY;
     u32 seed = SGK_Seed(gx, gz, tier);
-    s32 useEdgeCheck = CVarGetInteger("SGK.GrassEdgeCheck", 1) != 0;
+    s32 useEdgeCheck = sEdgeCheck;
     u32 raycastCost = useEdgeCheck ? 3u : 1u;
     /* One slot per hash in v0.4 could replace visible plants every frame.
      * 8-way bucket search retains nearby colliding keys simultaneously.
@@ -562,6 +566,7 @@ void SGKGrass_Draw(PlayState* play) {
     if (quality < 0) quality = 0;
     if (quality > 2) quality = 2;
     wind = CVarGetInteger("SGK.GrassWind", 1);
+    sEdgeCheck = CVarGetInteger("SGK.GrassEdgeCheck", 1) != 0;
     windPower = SGK_Clamp((f32)CVarGetInteger("SGK.GrassWindStrength", 100),
                            0.0f, 180.0f) * 0.01f;
     distancePercent = CVarGetInteger("SGK.GrassDistance", 100);
@@ -597,6 +602,7 @@ void SGKGrass_Draw(PlayState* play) {
      * PlayState lifetime; NEVER when Link merely changes elevation.
      */
     if (sCachedScene != play->sceneNum || sCachedQuality != quality ||
+        sCachedEdgeCheck != sEdgeCheck ||
         sCachedCollisionHeader != play->colCtx.colHeader ||
         play->gameplayFrames < sPreviousGameplayFrame) {
         SGK_ResetCache(play->sceneNum, quality);
