@@ -1,9 +1,10 @@
 /*
- * SGK Grass 0.4 - Kokiri, Ship of Harkinian 9.3.1.
+ * SGK Grass 0.5 - Kokiri, Ship of Harkinian 9.3.1.
  * Stable high-resolution world-space blades, conservative camera frustum,
  * overlapping distance LOD and smoothed actor bending.
- * SGK 0.4 addresses popping from collision streaming, integer vertex snapping,
- * layer cache clearing and hard distance cutoffs.
+ * SGK 0.5 eliminates direct-mapped cache thrash and view-dependent blade caps.
+ * Eight-way bucketed collision cache, fixed world-space thinning, low-amplitude
+ * wind, pre-warmed offscreen collision cells, stable tips at LOD boundaries.
  * Does not replace textures, OTR/O2R mods or character models.
  * The mask is based on collision surface sound, NOT visual texture/material.
  */
@@ -16,15 +17,19 @@
 #include <libultraship/bridge/consolevariablebridge.h>
 
 #define SGK_CACHE_CAPACITY 65536u
-#define SGK_CACHE_MASK (SGK_CACHE_CAPACITY - 1u)
+#define SGK_CACHE_WAYS 8u
+#define SGK_CACHE_BUCKETS (SGK_CACHE_CAPACITY / SGK_CACHE_WAYS)
+#define SGK_CACHE_BUCKET_MASK (SGK_CACHE_BUCKETS - 1u)
 #define SGK_BATCH_BLADES 10u /* 10 triangles = 30 vertices; N64 Fast3D limit is 32 */
 #define SGK_FLOOR_GRASS_SFX (NA_SE_PL_WALK_GRASS - SFX_FLAG)
 #define SGK_PI 3.14159265358979323846f
 #define SGK_MAX_INFLUENCES 24
 #define SGK_CHUNK_SIDE 6 /* group nearby cells before collision queries */
-#define SGK_VERTEX_PRECISION 2.0f /* vertex coordinates use 0.5 world-unit steps */
+#define SGK_VERTEX_PRECISION 4.0f /* 0.25-world-unit precision; Kokiri-only */
 #define SGK_VERTEX_SCALE (1.0f / SGK_VERTEX_PRECISION)
-#define SGK_NEW_CELL_FADE_FRAMES 12u
+#define SGK_NEW_CELL_FADE_FRAMES 24u
+#define SGK_PREFETCH_SAMPLES_PER_TIER 42u
+#define SGK_PREFETCH_PERIOD 8192u
 
 typedef struct SGKCell {
     s32 gridX, gridZ, layer;
@@ -35,6 +40,7 @@ typedef struct SGKCell {
     f32 pushX, pushZ; /* smoothed bend from actors */
     u32 lastBendFrame;
     u32 bornFrame;   /* age-based smooth reveal: no instantaneous cache insertion */
+    u32 lastUsedFrame; /* LRU for associative collision cache */
     f32 bendVelX, bendVelZ; /* damped spring, persists with the cell */
 } SGKCell;
 
@@ -70,6 +76,10 @@ static u32 sCulledCells = 0;
 static u32 sConsideredCells = 0;
 static u32 sNewCells = 0;
 static u32 sFrameCachedCells = 0;
+static u32 sCacheEvictions = 0;
+static u32 sPrecacheRequests = 0;
+static s32 sVersionLogged = 0;
+static u32 sPrefetchCursor[3] = { 0u, 0u, 0u };
 
 typedef struct SGKInfluence {
     f32 x, y, z;
@@ -127,6 +137,7 @@ static void SGK_InitView(const View* view) {
 static s32 SGK_Visible(f32 x, f32 y, f32 z, f32 radius) {
     f32 dx, dy, dz, forward, side, up;
     if (!sView.valid) return 1;
+    radius += 50.0f; /* frustum guard band; prevent camera-edge popping */
     dx = x - sView.ex; dy = y - sView.ey; dz = z - sView.ez;
     forward = dx * sView.fx + dy * sView.fy + dz * sView.fz;
     if (forward < -radius) return 0;
@@ -252,6 +263,8 @@ static void SGK_ResetCache(s32 scene, s32 quality) {
     sCachedQuality = quality;
     sCachedLayer = INT_MIN;
     sCacheMisses = 0;
+    sCacheEvictions = 0;
+    memset(sPrefetchCursor, 0, sizeof(sPrefetchCursor));
 }
 
 static s32 SGK_IsUnderwater(PlayState* play, f32 x, f32 y, f32 z) {
@@ -273,18 +286,40 @@ static s32 SGK_IsUnderwater(PlayState* play, f32 x, f32 y, f32 z) {
 static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 tier,
                             s32 layer, s32 spacing, f32 playerY, u32 raycastBudget) {
     u32 seed = SGK_Seed(gx, gz, tier);
-    u32 slot = SGK_Hash(seed ^ (u32)layer * 0x27d4eb2dU) & SGK_CACHE_MASK;
-    SGKCell* cell = &sCells[slot];
+    /* One slot per hash in v0.4 could replace visible plants every frame.
+     * 8-way bucket search retains nearby colliding keys simultaneously.
+     * Choose an unused slot, otherwise evict least recently used.
+     */
+    u32 bucket = (SGK_Hash(seed ^ (u32)layer * 0x27d4eb2dU) &
+                  SGK_CACHE_BUCKET_MASK) * SGK_CACHE_WAYS;
+    SGKCell* cell = NULL;
+    SGKCell* oldest = NULL;
+    u32 oldestAge = 0u;
+    u32 way;
+    for (way = 0; way < SGK_CACHE_WAYS; ++way) {
+        SGKCell* entry = &sCells[bucket + way];
+        if (entry->valid && entry->gridX == gx && entry->gridZ == gz &&
+            entry->tier == tier && entry->layer == layer) {
+            entry->lastUsedFrame = sFrameNumber;
+            return entry;
+        }
+        if (!entry->valid) { if (cell == NULL) cell = entry; continue; }
+        {
+            u32 age = sFrameNumber - entry->lastUsedFrame;
+            if (oldest == NULL || age > oldestAge) { oldest = entry; oldestAge = age; }
+        }
+    }
+    if (cell == NULL) cell = oldest;
     f32 x, z, floorY;
     Vec3f pos;
     CollisionPoly* poly = NULL;
     s32 bgId = BG_ACTOR_MAX;
 
-    if (cell->valid && cell->gridX == gx && cell->gridZ == gz &&
-        cell->tier == tier && cell->layer == layer) return cell;
     if (sRaycastsThisFrame >= raycastBudget) return NULL;
+    if (cell->valid) ++sCacheEvictions;
 
     cell->valid = 1;
+    cell->lastUsedFrame = sFrameNumber;
     cell->occupied = 0;
     cell->gridX = gx;
     cell->gridZ = gz;
@@ -312,12 +347,40 @@ static SGKCell* SGK_GetCell(PlayState* play, s32 gx, s32 gz, s32 tier,
     if (SurfaceType_GetSfx(&play->colCtx, poly, bgId) != SGK_FLOOR_GRASS_SFX) return cell;
     if (SGK_IsUnderwater(play, x, floorY, z)) return cell;
 
-    cell->y = floorY + 0.65f;
+    cell->y = floorY + 1.10f;
     cell->normalX = poly->normal.x;
     cell->normalY = poly->normal.y;
     cell->normalZ = poly->normal.z;
     cell->occupied = 1;
     return cell;
+}
+
+
+/* Populate collision data outside the camera using spare, bounded CPU budget.
+ * Rendering is still strictly frustum-culled. After several stationary frames,
+ * turning around usually finds a ready cache instead of bare ground.
+ * Deterministic golden-angle samples distribute work across all directions.
+ */
+static void SGK_Prewarm(PlayState* play, f32 px, f32 py, f32 pz,
+                        s32 quality, s32 layer, u32 budget, s32 distPct) {
+    u32 tier;
+    if (!CVarGetInteger("SGK.GrassPrecache", 1)) return;
+    for (tier = 0u; tier < 3u && sRaycastsThisFrame < budget; ++tier) {
+        SGKTier cfg = sTierSettings[quality][tier];
+        u32 sample;
+        f32 nearR = (f32)(cfg.innerRadius * distPct) / 100.0f;
+        f32 farR = (f32)(cfg.outerRadius * distPct) / 100.0f;
+        for (sample = 0u; sample < SGK_PREFETCH_SAMPLES_PER_TIER && sRaycastsThisFrame < budget; ++sample) {
+            u32 n = sPrefetchCursor[tier]++ % SGK_PREFETCH_PERIOD;
+            f32 ratio = ((f32)n + 0.5f) / (f32)SGK_PREFETCH_PERIOD;
+            f32 rad = sqrtf(nearR * nearR + (farR * farR - nearR * nearR) * ratio);
+            f32 ang = (f32)n * 2.39996322973f;
+            s32 gx = SGK_GridFloor(px + cosf(ang) * rad, cfg.spacing);
+            s32 gz = SGK_GridFloor(pz + sinf(ang) * rad, cfg.spacing);
+            (void)SGK_GetCell(play, gx, gz, (s32)tier, layer, cfg.spacing, py, budget);
+            ++sPrecacheRequests;
+        }
+    }
 }
 
 static void SGK_Vertex(Vtx* v, f32 x, f32 y, f32 z, u8 r, u8 g, u8 b) {
@@ -358,24 +421,30 @@ static void SGK_MakeBlade(Vtx* v, const SGKCell* cell, s32 gx, s32 gz,
     f32 dz = sinf(ang);
     u32 kind = (n >> 17) & 3u; /* short, upright, tall, wispy */
     f32 heightBase = kind == 0 ? 5.0f : kind == 1 ? 9.5f : kind == 2 ? 14.0f : 11.0f;
-    f32 h = (heightBase + 6.0f * SGK_Unit(SGK_Hash(n ^ 0xf66u))) * scale;
-    f32 w = ((tier == 0 ? 0.72f : tier == 1 ? 0.81f : 1.05f) +
-             0.36f * SGK_Unit(SGK_Hash(n ^ 0x117u))) * scale;
+    /* Shrinking width to zero at a LOD border generated subpixel, flickering
+     * triangles. Keep a stable silhouette and fade only the blade height.
+     * A faint root disappears after the ring boundary without sparkle.
+     */
+    f32 heightFade = 0.06f + 0.94f * scale;
+    f32 widthFade = 0.80f + 0.20f * scale;
+    f32 h = (heightBase + 6.0f * SGK_Unit(SGK_Hash(n ^ 0xf66u))) * heightFade;
+    f32 w = ((tier == 0 ? 1.05f : tier == 1 ? 1.08f : 1.15f) +
+             0.32f * SGK_Unit(SGK_Hash(n ^ 0x117u))) * widthFade;
     /* Shared slow gust per cell + individual ripples: fewer trigonometry calls
      * than computing two full waves anew for every leaf at every frame.
      */
-    f32 ripple = sinf(phase * 0.89f - z * 0.031f + (f32)(n & 255u) * 0.031f);
-    f32 high = tier == 0 ? sinf(phase * 1.48f + (f32)((n >> 8) & 255u) * 0.027f) * 0.17f : 0.0f;
-    f32 sway = wind ? (cellGust * 0.91f + ripple * 0.43f + high) * scale : 0.0f;
-    f32 bendX = sway * (0.59f + 0.15f * (f32)(n & 3u)) + cell->pushX * scale;
-    f32 bendZ = sway * (0.40f + 0.12f * (f32)((n >> 3) & 3u)) + cell->pushZ * scale;
+    f32 ripple = sinf(phase * 0.62f - z * 0.018f + (f32)(n & 255u) * 0.021f);
+    f32 high = tier == 0 ? sinf(phase * 1.02f + (f32)((n >> 8) & 255u) * 0.019f) * 0.09f : 0.0f;
+    f32 sway = wind ? (cellGust * 0.70f + ripple * 0.35f + high) * heightFade : 0.0f;
+    f32 bendX = sway * (0.59f + 0.15f * (f32)(n & 3u)) + cell->pushX * heightFade;
+    f32 bendZ = sway * (0.40f + 0.12f * (f32)((n >> 3) & 3u)) + cell->pushZ * heightFade;
     u32 tint = SGK_Hash(n ^ 0x3185u) % 25u;
     /* Muted BOTW-like greens, less stark tip/base contrast and sparkle. */
     u8 r0 = (u8)(kind == 3 ? 54u + tint : 45u + tint);
     u8 g0 = (u8)(kind == 3 ? 76u + tint : 67u + tint);
     u8 b0 = (u8)(29u + tint / 3u);
-    u8 r1 = (u8)(kind == 3 ? 82u + tint : 71u + tint);
-    u8 g1 = (u8)(kind == 3 ? 111u + tint : 99u + tint);
+    u8 r1 = (u8)(kind == 3 ? 75u + tint : 65u + tint);
+    u8 g1 = (u8)(kind == 3 ? 105u + tint : 94u + tint);
     u8 b1 = (u8)(41u + tint / 2u);
 
     if (cell->normalY > 0) {
@@ -399,6 +468,10 @@ void SGKGrass_Draw(PlayState* play) {
     ++sFrameNumber;
     if (play == NULL || play->sceneNum != SCENE_KOKIRI_FOREST ||
         !CVarGetInteger("SGK.GrassEnabled", 1) || play->colCtx.colHeader == NULL) return;
+    if (!sVersionLogged) {
+        osSyncPrintf("[SGK Grass 0.5] associative cache + stable LOD + background precache active\n");
+        sVersionLogged = 1;
+    }
 
     quality = CVarGetInteger("SGK.GrassQuality", 1);
     if (quality < 0) quality = 0;
@@ -421,7 +494,7 @@ void SGKGrass_Draw(PlayState* play) {
     py = GET_PLAYER(play)->actor.world.pos.y;
     pz = GET_PLAYER(play)->actor.world.pos.z;
     layer = SGK_GridFloor(py, 330);
-    phase = (f32)sFrameNumber * 0.026f; /* slower, softer movement */
+    phase = (f32)sFrameNumber * 0.0215f; /* gradual, spatial wind waves */
     sRaycastsThisFrame = 0;
 
     if (sCachedScene != play->sceneNum || sCachedQuality != quality) SGK_ResetCache(play->sceneNum, quality);
@@ -488,13 +561,18 @@ void SGKGrass_Draw(PlayState* play) {
         s32 playerChunkZ = SGK_GridFloor(pz, spacing * SGK_CHUNK_SIDE);
         s32 maxBand = maxR / (spacing * SGK_CHUNK_SIDE) + 2;
         s32 band, chunkX, chunkZ;
-        f32 density = (quality == 0 ? (tier == 0 ? 0.93f : tier == 1 ? 0.78f : 0.70f) :
-                       quality == 1 ? (tier == 0 ? 1.0f : tier == 1 ? 0.95f : 0.75f) :
-                                      (tier == 0 ? 1.0f : tier == 1 ? 0.98f : 0.80f));
-        u32 maxBlades = (quality == 0 ? (tier == 0 ? 11000u : tier == 1 ? 7000u : 2700u) :
-                         quality == 1 ? (tier == 0 ? 22000u : tier == 1 ? 14000u : 4300u) :
-                                        (tier == 0 ? 32000u : tier == 1 ? 21000u : 6300u));
-        u32 tierBlades = 0;
+        /* IMPORTANT: no frame-dependent maxBlades cut. In v0.4 the first
+         * visible cells used all capacity and the others abruptly disappeared
+         * whenever the camera turned. Density is now a stable hash decision
+         * per world-space cell, unaffected by view direction or frame order.
+         */
+        f32 density = (quality == 0 ? (tier == 0 ? 0.82f : tier == 1 ? 0.75f : 0.70f) :
+                       quality == 1 ? (tier == 0 ? 0.77f : tier == 1 ? 0.80f : 0.75f) :
+                                      (tier == 0 ? 0.70f : tier == 1 ? 0.72f : 0.76f));
+        s32 densityPercent = CVarGetInteger("SGK.GrassDensity", 100);
+        densityPercent = (s32)SGK_Clamp((f32)densityPercent, 30.0f, 125.0f);
+        density *= (f32)densityPercent * 0.01f;
+        if (density > 1.0f) density = 1.0f;
         if (distancePercent > 100) density *= 10000.0f / (f32)(distancePercent * distancePercent);
         for (band = 0; band <= maxBand; ++band) {
             s32 offsetZ, offsetX;
@@ -529,7 +607,6 @@ void SGKGrass_Draw(PlayState* play) {
                         }
                         seed = SGK_Seed(ix, iz, tier);
                         if (SGK_Unit(SGK_Hash(seed ^ 0x3bau)) > density) continue;
-                        if (tierBlades + cfg.bladesPerCell > maxBlades) continue;
                         cell = SGK_GetCell(play, ix, iz, tier, layer, spacing, py, (u32)budget);
                         if (cell == NULL || !cell->occupied) continue;
                         distance = sqrtf(d2);
@@ -543,9 +620,9 @@ void SGKGrass_Draw(PlayState* play) {
                         }
                         ageFade = SGK_Smooth((f32)(sFrameNumber - cell->bornFrame) / (f32)SGK_NEW_CELL_FADE_FRAMES);
                         if (ageFade < fade) fade = ageFade;
-                        if (fade < 0.035f) continue;
+                        if (fade < 0.035f) continue; /* roots are tiny at this distance */
                         SGK_UpdateBend(cell, x, cell->y, z, interaction);
-                        cellGust = wind ? sinf(phase * 0.44f + x * 0.014f + z * 0.012f) : 0.0f;
+                        cellGust = wind ? sinf(phase * 0.34f + x * 0.012f + z * 0.010f) : 0.0f;
                         ++sFrameCachedCells;
                         for (blade = 0; blade < cfg.bladesPerCell; ++blade) {
                             if (batch == NULL) {
@@ -556,7 +633,6 @@ void SGKGrass_Draw(PlayState* play) {
                                           blade, tier, phase, wind, fade, cellGust);
                             vertsInBatch += 3u;
                             ++totalBlades;
-                            ++tierBlades;
                             if (vertsInBatch == SGK_BATCH_BLADES * 3u) SGK_FLUSH_BATCH();
                         }
                         ++totalCells;
@@ -575,10 +651,14 @@ SGK_Finish:
     gDPPipeSync(POLY_OPA_DISP++);
     POLY_OPA_DISP = Gfx_SetupDL(POLY_OPA_DISP, 25);
     CLOSE_DISPS(play->state.gfxCtx);
+    /* Prefetch offscreen grass only when visible rendering is finished. */
+    sPrecacheRequests = 0;
+    SGK_Prewarm(play, px, py, pz, quality, layer, (u32)budget, distancePercent);
 
     if (CVarGetInteger("SGK.GrassDebug", 0) && (sFrameNumber % 300u) == 0u) {
-        osSyncPrintf("[SGK 0.4] quality=%d dist=%d%% cells=%u blades=%u rays=%u new=%u visible_cells=%u cache=%u culled_chunks=%u culled_cells=%u actors=%u\n",
+        osSyncPrintf("[SGK 0.5] quality=%d dist=%d%% cells=%u blades=%u rays=%u new=%u cache_evictions=%u precache=%u visible_cells=%u cache=%u culled_chunks=%u culled_cells=%u actors=%u\n",
                      quality, distancePercent, sDrawnCells, sDrawnBlades, sRaycastsThisFrame,
-                     sNewCells, sFrameCachedCells, sCacheMisses, sCulledChunks, sCulledCells, sInfluenceCount);
+                     sNewCells, sCacheEvictions, sPrecacheRequests, sFrameCachedCells,
+                     sCacheMisses, sCulledChunks, sCulledCells, sInfluenceCount);
     }
 }
