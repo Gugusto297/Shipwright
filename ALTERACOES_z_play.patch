@@ -1,22 +1,26 @@
 --- a/soh/src/code/z_play.c
 +++ b/soh/src/code/z_play.c
-@@ -12,8 +12,9 @@
- #include "soh/OTRGlobals.h"
+@@ -13,6 +13,7 @@
  #include "soh/ResourceManagerHelpers.h"
  #include "soh/SaveManager.h"
  #include "soh/framebuffer_effects.h"
-+#include "soh/Enhancements/SGK/SGKGrass.h" // SGK GRAMA 3D
++#include "soh/Enhancements/SGK/SGKGrass.h"
  
  #include <time.h>
  #include <assert.h>
+@@ -1282,6 +1283,7 @@
+     PLAY_LOG(3816);
+     Environment_Update(play, &play->envCtx, &play->lightCtx, &play->pauseCtx, &play->msgCtx, &play->gameOverCtx,
+                        play->state.gfxCtx);
++    SGKGrass_PrewarmTransition(play);
+ }
  
-@@ -1520,8 +1521,9 @@
-         }
+ void Play_DrawOverlayElements(PlayState* play) {
+@@ -1521,6 +1523,7 @@
  
          if ((HREG(80) != 10) || (HREG(85) != 0)) {
              Actor_DrawAll(play, &play->actorCtx);
-+            SGKGrass_Draw(play); // SGK: grama 3D depois dos atores e com teste de profundidade
++            SGKGrass_Draw(play);
          }
  
          if ((HREG(80) != 10) || (HREG(86) != 0)) {
-             if (!play->envCtx.sunMoonDisabled) {

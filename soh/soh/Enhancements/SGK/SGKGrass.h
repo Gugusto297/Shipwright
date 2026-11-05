@@ -9,6 +9,7 @@ extern "C" {
 
 // Desenha a vegetacao procedural de Kokiri; e um prototipo seguro e desativavel.
 void SGKGrass_Draw(PlayState* play);
+void SGKGrass_PrewarmTransition(PlayState* play);
 
 #ifdef __cplusplus
 }
