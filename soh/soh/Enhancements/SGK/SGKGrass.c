@@ -1,5 +1,6 @@
 /*
- * SGK Grass 0.8 - Hyrule LOD and entrance prewarm across the full game, SoH 9.3.1.
+ * SGK Grass 0.9 - stable, prewarmed world-space vegetation, SoH 9.3.1.
+ * TriAevum is the architecture reference; no Vulkan source is copied.
  * Stable high-resolution world-space blades, conservative camera frustum,
  * overlapping distance LOD and smoothed actor bending.
  * SGK 0.7 keeps elevation-independent sampling and adds conservative material checks.
@@ -32,7 +33,7 @@
 #define SGK_CHUNK_SIDE 6 /* group nearby cells before collision queries */
 #define SGK_VERTEX_PRECISION 4.0f /* 0.25-world-unit precision in camera-local coordinates */
 #define SGK_VERTEX_SCALE (1.0f / SGK_VERTEX_PRECISION)
-#define SGK_NEW_CELL_FADE_FRAMES 60u
+#define SGK_NEW_CELL_FADE_FRAMES 12u
 #define SGK_PREFETCH_SAMPLES_PER_TIER 24u
 #define SGK_PREFETCH_PERIOD 8192u
 
@@ -68,8 +69,8 @@ static const SGKTier sTierSettings[3][3] = {
 /* Long-range grass is intentionally sparse at the horizon for Intel UHD. */
 static const SGKTier sFieldSettings[3][3] = {
     { { 15, 0, 425, 8 }, { 37, 310, 1250, 4 }, { 135, 1000, 3400, 2 } },
-    { { 10, 0, 510, 12 }, { 28, 365, 1750, 7 }, { 115, 1400, 4800, 2 } },
-    { {  9, 0, 590, 14 }, { 25, 425, 2120, 8 }, { 115, 1700, 5600, 3 } },
+    { { 10, 0, 510, 13 }, { 28, 365, 1750, 7 }, { 115, 1400, 4800, 3 } },
+    { {  9, 0, 590, 16 }, { 25, 425, 2120, 9 }, { 115, 1700, 5600, 4 } },
 };
 static SGKTier SGK_TierForScene(const PlayState* play, s32 quality, s32 tier) {
     return play->sceneNum == SCENE_HYRULE_FIELD ? sFieldSettings[quality][tier] : sTierSettings[quality][tier];
@@ -461,24 +462,31 @@ static f32 SGK_RadicalInverse(u32 x) {
     x = ((x & 0x55555555u) << 1u) | ((x & 0xaaaaaaaau) >> 1u);
     return (f32)x * 2.3283064365386963e-10f;
 }
+/* Camera-independent reserve inspired by TriAevum's source placement cache.
+ * Alternate LOD rings to avoid exhausting transition raycasts on near cells.
+ * Mature the cache during fade-in instead of replaying a full reveal afterward.
+ */
 static void SGK_Prewarm(PlayState* play, f32 px, f32 py, f32 pz,
                         s32 quality, s32 layer, u32 budget, s32 distPct,
                         u32 samplesPerTier) {
-    u32 tier;
+    u32 sample, tier;
     if (!CVarGetInteger("SGK.GrassPrecache", 1)) return;
-    for (tier = 0u; tier < 3u && sRaycastsThisFrame < budget; ++tier) {
-        SGKTier cfg = SGK_TierForScene(play, quality, (s32)tier);
-        u32 sample;
-        f32 nearR = (f32)(cfg.innerRadius * distPct) / 100.0f;
-        f32 farR = (f32)(cfg.outerRadius * distPct) / 100.0f;
-        for (sample = 0u; sample < samplesPerTier && sRaycastsThisFrame < budget; ++sample) {
+    for (sample = 0u; sample < samplesPerTier && sRaycastsThisFrame < budget; ++sample) {
+        for (tier = 0u; tier < 3u && sRaycastsThisFrame < budget; ++tier) {
+            SGKTier cfg = SGK_TierForScene(play, quality, (s32)tier);
             u32 n = sPrefetchCursor[tier]++;
+            f32 nearR = (f32)(cfg.innerRadius * distPct) / 100.0f;
+            f32 farR = (f32)(cfg.outerRadius * distPct) / 100.0f;
             f32 ratio = SGK_RadicalInverse(n + 1u);
             f32 rad = sqrtf(nearR * nearR + (farR * farR - nearR * nearR) * ratio);
             f32 ang = (f32)n * 2.39996322973f;
             s32 gx = SGK_GridFloor(px + cosf(ang) * rad, cfg.spacing);
             s32 gz = SGK_GridFloor(pz + sinf(ang) * rad, cfg.spacing);
-            (void)SGK_GetCell(play, gx, gz, (s32)tier, layer, cfg.spacing, py, budget);
+            SGKCell* cell = SGK_GetCell(play, gx, gz, (s32)tier, layer, cfg.spacing, py, budget);
+            if (cell != NULL && cell->occupied) {
+                /* Unsigned wrap is valid during first fade before the draw counter starts. */
+                cell->bornFrame = sFrameNumber - SGK_NEW_CELL_FADE_FRAMES;
+            }
             ++sPrecacheRequests;
         }
     }
@@ -587,7 +595,7 @@ void SGKGrass_Draw(PlayState* play) {
     if (play == NULL || !CVarGetInteger("SGK.GrassEnabled", 1) ||
         play->colCtx.colHeader == NULL) return;
     if (!sVersionLogged) {
-        osSyncPrintf("[SGK Grass 0.8] fade prewarm, farther Hyrule, denser near grass\n");
+        osSyncPrintf("[SGK Grass 0.9] balanced prewarm, stable LOD and independent density\n");
         sVersionLogged = 1;
     }
 
@@ -711,15 +719,15 @@ void SGKGrass_Draw(PlayState* play) {
          * per world-space cell, unaffected by view direction or frame order.
          */
         f32 density = (quality == 0 ? (tier == 0 ? 0.82f : tier == 1 ? 0.75f : 0.70f) :
-                       quality == 1 ? (tier == 0 ? 0.77f : tier == 1 ? 0.80f : 0.75f) :
-                                      (tier == 0 ? 0.70f : tier == 1 ? 0.72f : 0.76f));
+                       quality == 1 ? (tier == 0 ? 0.86f : tier == 1 ? 0.82f : 0.78f) :
+                                      (tier == 0 ? 0.76f : tier == 1 ? 0.77f : 0.79f));
         s32 densityPercent = CVarGetInteger("SGK.GrassDensity", 100);
         densityPercent = (s32)SGK_Clamp((f32)densityPercent, 30.0f, 125.0f);
         density *= (f32)densityPercent * 0.01f;
         if (density > 1.0f) density = 1.0f;
-        if (distancePercent > 100) density *= 10000.0f / (f32)(distancePercent * distancePercent);
+        /* More draw distance does not reduce the density of near grass. */
         if (play->sceneNum == SCENE_HYRULE_FIELD && tier == 2)
-            density *= quality == 0 ? 0.45f : (quality == 1 ? 0.52f : 0.58f);
+            density *= quality == 0 ? 0.48f : (quality == 1 ? 0.67f : 0.72f);
         for (band = 0; band <= maxBand; ++band) {
             s32 offsetZ, offsetX;
             for (offsetZ = -band; offsetZ <= band; ++offsetZ) {
@@ -783,19 +791,22 @@ void SGKGrass_Draw(PlayState* play) {
                         }
                         ageFade = SGK_Smooth((f32)(sFrameNumber - cell->bornFrame) / (f32)SGK_NEW_CELL_FADE_FRAMES);
                         if (ageFade < fade) fade = ageFade;
-                        if (fade < 0.035f) continue; /* roots are tiny at this distance */
+                        if (fade < 0.025f) continue; /* stable dither handles ring edges */
                         if (tier == 0) SGK_UpdateBend(cell, x, cell->y, z, interaction);
                         cellGust = wind ? sinf(phase * 0.33f + x * 0.010f + z * 0.008f) : 0.0f;
                         cellGust2 = wind ? sinf(phase * 0.24f - x * 0.006f +
                                                   z * 0.011f + 1.41f) : 0.0f;
                         ++sFrameCachedCells;
                         for (blade = 0; blade < cfg.bladesPerCell; ++blade) {
+                            /* Stable world-space dithering avoids moving subpixel triangles. */
+                            if (SGK_Unit(SGK_Hash(cell->seed ^
+                                ((blade + 1u) * 0x9e3779b9u) ^ 0xf013u)) >= fade) continue;
                             if (batch == NULL) {
                                 batch = Graph_Alloc(play->state.gfxCtx, sizeof(Vtx) * 3u * SGK_BATCH_BLADES);
                                 if (batch == NULL) goto SGK_Finish;
                             }
                             SGK_MakeBlade(&batch[vertsInBatch], cell, ix, iz, spacing,
-                                          blade, tier, phase, wind, fade, cellGust,
+                                          blade, tier, phase, wind, 1.0f, cellGust,
                                           cellGust2, heightScale, windPower);
                             vertsInBatch += 3u;
                             ++totalBlades;
@@ -822,7 +833,7 @@ SGK_Finish:
     SGK_Prewarm(play, px, py, pz, quality, layer, (u32)budget, distancePercent, SGK_PREFETCH_SAMPLES_PER_TIER);
 
     if (CVarGetInteger("SGK.GrassDebug", 0) && (sFrameNumber % 300u) == 0u) {
-        osSyncPrintf("[SGK 0.8] scene=%d quality=%d dist=%d%% cells=%u blades=%u rays=%u new=%u cache_evictions=%u precache=%u visible_cells=%u cache=%u culled_chunks=%u culled_cells=%u actors=%u\n",
+        osSyncPrintf("[SGK 0.9] scene=%d quality=%d dist=%d%% cells=%u blades=%u rays=%u new=%u cache_evictions=%u precache=%u visible_cells=%u cache=%u culled_chunks=%u culled_cells=%u actors=%u\n",
                      play->sceneNum, quality, distancePercent, sDrawnCells, sDrawnBlades, sRaycastsThisFrame,
                      sNewCells, sCacheEvictions, sPrecacheRequests, sFrameCachedCells,
                      sCacheMisses, sCulledChunks, sCulledCells, sInfluenceCount);
