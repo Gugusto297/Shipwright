@@ -1,0 +1,61 @@
+name: Compilar SoH Switch com Bloom
+on:
+  push:
+    branches:
+      - switch-bloom-experimental
+    paths:
+      - 'switch-bloom/**'
+      - '.github/workflows/switch-bloom.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-switch:
+    name: Gerar soh.nro para Switch Lite
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260219
+    timeout-minutes: 90
+    steps:
+      - name: Baixar patch deste repositorio
+        uses: actions/checkout@v4
+      - name: Buscar codigo SoH 9.3.1-nx2
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git clone --branch 9.3.1-nx2 --depth 1 https://github.com/timschneeb/Shipwright-Switch.git game-src
+          cd game-src
+          git config -f .gitmodules submodule.libultraship.url https://github.com/timschneeb/libultraship-switch.git
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          git config --global --add safe.directory "$PWD"
+      - name: Aplicar Bloom experimental
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 switch-bloom/apply_patch.py game-src
+          grep -n 'SwitchBloom::Apply' game-src/libultraship/src/fast/backends/gfx_sdl2.cpp
+      - name: Compilar homebrew com devkitA64
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cmake -S game-src -B game-src/build-switch -G Ninja             -DCMAKE_TOOLCHAIN_FILE=/opt/devkitpro/cmake/Switch.cmake             -DCMAKE_BUILD_TYPE=Release             -DENABLE_SCRIPTING=0
+          cmake --build game-src/build-switch --target soh_nro --config Release -j4
+          test -s game-src/build-switch/soh/soh.nro
+      - name: Preparar arquivo instalavel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p entrega/switch/soh
+          cp game-src/build-switch/soh/soh.nro entrega/switch/soh/soh.nro
+          cp switch-bloom/README.md entrega/LEIA-ME.md
+          sha256sum entrega/switch/soh/soh.nro
+      - name: Disponibilizar soh.nro
+        uses: actions/upload-artifact@v4
+        with:
+          name: SoH-Switch-Bloom-Experimental
+          path: entrega/
+          if-no-files-found: error
+          retention-days: 7
